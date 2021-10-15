@@ -10,8 +10,9 @@ from enum import IntEnum
 from functools import wraps
 
 from soulstruct.game_types.basic_types import GameObjectSequence
+from soulstruct.game_types.msb_types import Map
 from soulstruct.utilities.binary import BinaryStruct, BinaryReader
-from soulstruct.utilities.maths import Vector3, Matrix3, resolve_rotation
+from soulstruct.utilities.maths import Vector, Vector3, Matrix3, resolve_rotation
 
 from .exceptions import MapError
 from .utils import MapFieldInfo
@@ -66,14 +67,15 @@ class MSBEntry(abc.ABC):
             except KeyError:
                 raise ValueError(f"`name` must be given to `{self.__class__.__name__}` if no binary `source` is given.")
             self.description = kwargs.pop("description", "")
-            for field_name, field_info in self.FIELD_INFO.items():
+            default_values = self.get_default_values()
+            for field_name in self.FIELD_INFO:
                 try:
                     value = kwargs.pop(field_name)
                 except KeyError:
                     try:
-                        value = field_info.default.copy()  # mutable default
+                        value = default_values[field_name].copy()  # mutable default (e.g. `list`, `set`, `Vector3`)
                     except AttributeError:
-                        value = field_info.default  # immutable default
+                        value = default_values[field_name]  # immutable default (e.g. `int`, `float`, `str`, `tuple`)
                 if isinstance(value, IntEnum):
                     value = value.value
                 setattr(self, field_name, value)
@@ -173,29 +175,43 @@ class MSBEntry(abc.ABC):
                         if getattr(self, field_name) == old_name:
                             setattr(self, field_name, new_name)
 
-    def __repr__(self):
-        kwargs = {}
-        default = self.__class__(name="__DEFAULT__")
-        for name in self.field_names:
+    def to_dict(self, ignore_defaults=True) -> dict[str, tp.Any]:
+        default_values = self.get_default_values()
+        data = {"name": self.name}
+        for name in self.all_field_names:
             value = getattr(self, name)
-            default_value = getattr(default, name)
-            if value == default_value:
-                continue  # ignore default values
-            kwargs[name] = value
-        if kwargs:
-            fields = "\n    ".join(f"{k}={repr(v)}," for k, v in kwargs.items())
-            return f"{self.__class__.__name__}(\n    name={repr(self.name)},\n    {fields}\n)"
-        return f"{self.__class__.__name__}(name={repr(self.name)})"
+            if ignore_defaults and value == default_values[name]:
+                continue  # don't add default values to dictionary
+            if isinstance(value, Vector):
+                data[name] = list(value)
+            elif isinstance(value, Map):
+                data[name] = str(value)
+            elif isinstance(value, set):
+                data[name] = sorted(value)
+            else:
+                data[name] = value
+        return data
+
+    def get_default_values(self):
+        return {field_name: field_info.default for field_name, field_info in self.FIELD_INFO.items()}
+
+    def __repr__(self):
+        data = self.to_dict(ignore_defaults=True)
+        fields = "\n    ".join(f"{k}={repr(v)}," for k, v in data.items())
+        return f"{self.__class__.__name__}(\n    {fields}\n)"
 
 
 MSBEntryType = tp.TypeVar("MSBEntryType", bound=MSBEntry)
-EntrySpecType = tp.Union[MSBEntry, int, str]  # valid entry specifications: entry instance, local index, or name
+# Valid ways to specify an entry: entry instance, local index, or name from a `str` or the name of an `IntEnum` member
+EntrySpecType = tp.Union[MSBEntry, int, IntEnum, str]
 
 
 def _entry_lookup(func):
     @wraps(func)
     def wrapped(self: MSBEntryList, entry: EntrySpecType, entry_subtype: MSBSubtype = None, *args, **kwargs):
-        if isinstance(entry, int):
+        if isinstance(entry, IntEnum):
+            entry = self.get_entry_by_name(entry_name=entry.name, entry_subtype=entry_subtype)
+        elif isinstance(entry, int):
             entry = self.get_entries(entry_subtype)[entry]
         elif isinstance(entry, str):
             entry = self.get_entry_by_name(entry_name=entry, entry_subtype=entry_subtype)
@@ -211,6 +227,7 @@ def _entry_lookup(func):
 
 class MSBEntryList(abc.ABC, tp.Generic[MSBEntryType]):
 
+    INTERNAL_NAME = ""
     MAP_ENTITY_LIST_HEADER: BinaryStruct = None
     MAP_ENTITY_ENTRY_OFFSET: BinaryStruct = None
     MAP_ENTITY_LIST_TAIL: BinaryStruct = None
@@ -220,21 +237,13 @@ class MSBEntryList(abc.ABC, tp.Generic[MSBEntryType]):
     SUBTYPE_CLASSES: dict[MSBSubtype, tp.Type[MSBEntry]] = None
     SUBTYPE_OFFSET: int = None  # binary `MSBEntry` offset where subtype integer can be read from
 
-    def __init__(self, msb_entry_list_source=None, name=""):
-        self.name = ""
+    def __init__(self, msb_entry_list_source=None):
         self._entries = []
 
         if msb_entry_list_source is None:
             return
 
         if isinstance(msb_entry_list_source, (list, tuple, dict)):
-            if not name:
-                raise ValueError("Name of MSB entry list must be given if created manually.")
-            if name not in {"POINT_PARAM_ST", "EVENT_PARAM_ST", "PARTS_PARAM_ST", "MODEL_PARAM_ST"}:
-                raise ValueError(
-                    "Name of MSB entry list must be MODEL_PARAM_ST, EVENT_PARAM_ST, POINT_PARAM_ST, "
-                    "or PARTS_PARAM_ST."
-                )
             if isinstance(msb_entry_list_source, dict):
                 msb_entry_list_source = [msb_entry_list_source[k] for k in sorted(msb_entry_list_source)]
             if isinstance(msb_entry_list_source, (list, tuple)):
@@ -258,8 +267,9 @@ class MSBEntryList(abc.ABC, tp.Generic[MSBEntryType]):
             for _ in range(header["entry_offset_count"] - 1)  # 'entry_offset_count' includes tail offset
         ]
         next_entry_list_offset = msb_reader.unpack_struct(self.MAP_ENTITY_LIST_TAIL)["next_entry_list_offset"]
-        self.name = msb_reader.unpack_string(offset=header["name_offset"], encoding=self.NAME_ENCODING)
-
+        name = msb_reader.unpack_string(offset=header["name_offset"], encoding=self.NAME_ENCODING)
+        if name != self.INTERNAL_NAME:
+            raise ValueError(f"MSB entry list internal name '{name}' does not match known name '{self.INTERNAL_NAME}'.")
         self._entries = []
 
         for entry_offset in entry_offsets:
@@ -278,7 +288,7 @@ class MSBEntryList(abc.ABC, tp.Generic[MSBEntryType]):
             + self.MAP_ENTITY_ENTRY_OFFSET.size * len(entries)
             + self.MAP_ENTITY_LIST_TAIL.size
         )
-        packed_name = self.name.encode("utf-8")
+        packed_name = self.INTERNAL_NAME.encode("utf-8")
         name_offset = offset
         while len(packed_name) < 32:
             packed_name += b"\0"
@@ -319,6 +329,10 @@ class MSBEntryList(abc.ABC, tp.Generic[MSBEntryType]):
         """Count of all entries."""
         return len(self._entries)
 
+    def clear(self):
+        """Delete all entries of all subtypes in list."""
+        self._entries.clear()
+
     @classmethod
     def resolve_entry_subtype(cls, entry_subtype):
         """Converts any valid entry subtype specification into the proper subtype enum."""
@@ -337,9 +351,11 @@ class MSBEntryList(abc.ABC, tp.Generic[MSBEntryType]):
         except (TypeError, ValueError):
             raise TypeError(f"Invalid entry subtype for entry list {cls.PLURALIZED_NAME}: {entry_subtype}")
 
-    def __getitem__(self, entry: tp.Union[int, str]) -> MSBEntryType:
+    def __getitem__(self, entry: tp.Union[int, IntEnum, str]) -> MSBEntryType:
         """You can access entries using their global index or (if unique) name."""
-        if isinstance(entry, int):
+        if isinstance(entry, IntEnum):
+            return self.get_entry_by_name(entry_name=entry.name, entry_subtype=None)
+        elif isinstance(entry, int):
             return self.get_entries()[entry]
         elif isinstance(entry, str):
             return self.get_entry_by_name(entry_name=entry, entry_subtype=None)
@@ -354,7 +370,7 @@ class MSBEntryList(abc.ABC, tp.Generic[MSBEntryType]):
             - the `MSBEnvironmentEvent` entry linked to by an `MSBCollision` entry
         """
         if entry_subtype is None:
-            return self._entries  # Full entry list, with types potentially intermingled.
+            return list(self._entries)  # Full entry list, with types potentially intermingled.
         entry_subtype = self.resolve_entry_subtype(entry_subtype)
         return [e for e in self._entries if e.ENTRY_SUBTYPE == entry_subtype]
 
@@ -419,7 +435,7 @@ class MSBEntryList(abc.ABC, tp.Generic[MSBEntryType]):
                 insert_below_original=insert_below_original,
                 **kwargs,
             )
-        if "name" not in kwargs or kwargs["name"] is None:
+        if kwargs.get("name", None) is None and kwargs.get("entity_enum", None) is None:
             kwargs["name"] = self._get_duplicate_tagged_name(f"New {entry_subtype.name}")
         entry = self.SUBTYPE_CLASSES[entry_subtype](source=None, **kwargs)
         if auto_add:
@@ -455,7 +471,7 @@ class MSBEntryList(abc.ABC, tp.Generic[MSBEntryType]):
 
         if kwargs.get("name", "") == entry.name and entry in self._entries:
             raise ValueError(f"Name of duplicated entry cannot be set to the source entry's name: {entry.name}")
-        if "name" not in kwargs or kwargs["name"] is None:
+        if kwargs.get("name", None) is None and kwargs.get("entity_enum", None) is None:
             # First, try a basic increment of any trailing numerals.
             if name_index_match := re.match(r"(.*)(\d+)", duplicated.name):
                 name_prefix = name_index_match.group(1)
@@ -561,6 +577,17 @@ class MSBEntryList(abc.ABC, tp.Generic[MSBEntryType]):
             unique_names[i] = entry.name
         return unique_names
 
+    def to_dict(self, ignore_defaults=True) -> [dict[str, list[dict[str, tp.Any]]]]:
+        """Get the entry list as a dictionary mapping entry subtype names to lists of entry dictionaries."""
+        data = {}
+        for entry_subtype_enum in self.ENTRY_SUBTYPE_ENUM:
+            subtype_entries = self.get_entries(entry_subtype_enum)
+            if subtype_entries:
+                data[entry_subtype_enum.name] = [
+                    entry.to_dict(ignore_defaults=ignore_defaults) for entry in subtype_entries
+                ]
+        return data
+
 
 class MSBEntryEntity(MSBEntry, abc.ABC):
     """Subclass of MSBEntry with 'entity_id' field (everything except Models). Useful for type checking."""
@@ -575,6 +602,34 @@ class MSBEntryEntity(MSBEntry, abc.ABC):
     }
 
     entity_id: int
+
+    def __init__(self, source=None, entity_enum: IntEnum = None, **kwargs):
+        """Accepts `entity_enum` kwargs to pull both `name` and `entity_id` (value) from."""
+        if entity_enum is not None:
+            self._parse_entity_enum(entity_enum, kwargs)
+        super().__init__(source, **kwargs)
+
+    def set(self, entity_enum: IntEnum = None, **kwargs):
+        """Update any attribute fields with keyword arguments.
+
+        Argument keys starting with double underscore are ignored so that `BinaryStruct`-produced dictionaries can
+        easily be passed in. See `__setitem__()` for more.
+        """
+        if entity_enum is not None:
+            self._parse_entity_enum(entity_enum, kwargs)
+        for field_name, value in kwargs.items():
+            if not field_name.startswith("__"):
+                self[field_name] = value
+
+    @classmethod
+    def _parse_entity_enum(cls, entity_enum: IntEnum, kwargs: dict[str, tp.Any]):
+        if "name" in kwargs or "entity_id" in kwargs:
+            raise ValueError(
+                f"Cannot initialize or set `{cls.__name__}` with both `entity_enum` and `name`/`entity_id`.")
+        if not isinstance(entity_enum, IntEnum):
+            raise TypeError(f"`entity_enum` must be an `IntEnum` subclass, not `{type(entity_enum)}`.")
+        kwargs["name"] = entity_enum.name
+        kwargs["entity_id"] = entity_enum.value
 
 
 class MSBEntryEntityCoordinates(MSBEntryEntity, abc.ABC):

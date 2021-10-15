@@ -41,6 +41,7 @@ __all__ = [
     "MapConnection",
 
     "Region",
+    "RegionVolume",
     "RegionPoint",
     "RegionCircle",
     "RegionSphere",
@@ -141,7 +142,7 @@ class Map(GameObject):
             if stem
         }
 
-    def __eq__(self, other_map):
+    def __eq__(self, other_map: Map):
         return self.area_id == other_map.area_id and self.block_id == other_map.block_id
 
     def __iter__(self):
@@ -149,6 +150,11 @@ class Map(GameObject):
 
     def __repr__(self):
         return self.emevd_file_stem
+
+    @classmethod
+    def NO_MAP(cls):
+        """Used as a default null map in MSB."""
+        return cls(0, 0, name="NONE")
 
 
 class MapEntry(GameObject):
@@ -187,7 +193,11 @@ class MapEntity(MapEntry, IntEnum):
 
     @classmethod
     def auto_generate(cls, count, game: Game, map_range_start: int):
-        start_value, max_value = cls.get_id_start_and_max(game)  # will raise `TypeError` if not valid for this class
+        """Get value for `auto()`.
+
+        Raises `TypeError` if not valid for this class, and `NotImplementedError` if not implemented for given `game`.
+        """
+        start_value, max_value = cls.get_id_start_and_max(game)
         value = map_range_start + start_value + count
         if value > map_range_start + max_value:
             raise ValueError(f"Too many members in `{cls.__name__}` for `auto()` range `({start_value}, {max_value})`.")
@@ -261,6 +271,12 @@ class MapEvent(MapEntity):
     @classmethod
     def get_msb_entry_type_subtype(cls, pluralized_subtype=False):
         return "Events", None
+
+    def auto_region_name(self):
+        event_enum_subclass = self.__class__.__bases__[0]
+        while event_enum_subclass.__bases__[0] is not MapEvent:
+            event_enum_subclass = event_enum_subclass.__bases__[0]
+        return f"_{event_enum_subclass.__name__}_{self.name.lstrip('_')}"
 
 
 class LightEvent(MapEvent):
@@ -383,7 +399,7 @@ class SpawnPointEvent(MapEvent):
     @classmethod
     def get_id_start_and_max(cls, game: Game) -> tuple[int, int]:
         if game in (DARK_SOULS_PTDE, DARK_SOULS_DSR):
-            return 3900, 3999
+            return 3900, 3949  # 3950-3989 reserved for bonfire spawn points
         raise NotImplementedError(f"Entity ID range not implemented for {game.name}.")
 
 
@@ -430,6 +446,7 @@ class NPCInvasionEvent(MapEvent):
 
 class Region(MapEntity):
     """Condition upon a region as a shortcut to condition upon the player being inside it (condition only)."""
+
     def __call__(self, negate=False, condition=None, skip_lines=0):
         from soulstruct.base.events.emevd.utils import get_value_test
         from soulstruct.base.events.emevd import instructions as instr
@@ -447,8 +464,8 @@ class Region(MapEntity):
             if_false_func=instr.IfPlayerOutsideRegion,
         )
 
-    @property
-    def coord_entity_type(self):
+    @classmethod
+    def get_coord_entity_type(cls):
         from soulstruct.base.events.emevd.enums import CoordEntityType
 
         return CoordEntityType.Region
@@ -457,10 +474,14 @@ class Region(MapEntity):
     def get_msb_entry_type_subtype(cls, pluralized_subtype=False):
         return "Regions", None
 
+
+class RegionVolume(Region):
+    """Soulstruct ABC for Spheres, Cylinders, and Boxes, which share an auto-enumeration schema separate from Points."""
+
     @classmethod
     def get_id_start_and_max(cls, game: Game) -> tuple[int, int]:
         if game in (DARK_SOULS_PTDE, DARK_SOULS_DSR):
-            return 2000, 2899
+            return 2000, 2499
         raise NotImplementedError(f"Entity ID range not implemented for {game.name}.")
 
 
@@ -470,6 +491,12 @@ class RegionPoint(Region):
     def get_msb_entry_type_subtype(cls, pluralized_subtype=False):
         return ("Regions", "Points") if pluralized_subtype else ("Regions", "Point")
 
+    @classmethod
+    def get_id_start_and_max(cls, game: Game) -> tuple[int, int]:
+        if game in (DARK_SOULS_PTDE, DARK_SOULS_DSR):
+            return 2500, 2899
+        raise NotImplementedError(f"Entity ID range not implemented for {game.name}.")
+
 
 class RegionCircle(Region):
     """2D circle region. Never used."""
@@ -478,14 +505,14 @@ class RegionCircle(Region):
         return ("Regions", "Circles") if pluralized_subtype else ("Regions", "Circle")
 
 
-class RegionSphere(Region):
+class RegionSphere(RegionVolume):
     """3D spherical region."""
     @classmethod
     def get_msb_entry_type_subtype(cls, pluralized_subtype=False):
         return ("Regions", "Spheres") if pluralized_subtype else ("Regions", "Sphere")
 
 
-class RegionCylinder(Region):
+class RegionCylinder(RegionVolume):
     """3D cylindrical region."""
     @classmethod
     def get_msb_entry_type_subtype(cls, pluralized_subtype=False):
@@ -499,7 +526,7 @@ class RegionRect(Region):
         return ("Regions", "Rects") if pluralized_subtype else ("Regions", "Rect")
 
 
-class RegionBox(Region):
+class RegionBox(RegionVolume):
     """3D box region."""
     @classmethod
     def get_msb_entry_type_subtype(cls, pluralized_subtype=False):
@@ -529,6 +556,7 @@ class MapPiece(MapPart):
 
 class Object(MapPart):
     """Condition upon an object as a shortcut to condition upon it *not* being destroyed."""
+
     def __call__(self, negate=False, condition=None, skip_lines=0, end_event=False, restart_event=False):
         from soulstruct.base.events.emevd.utils import get_value_test
         from soulstruct.base.events.emevd import instructions as instr
@@ -554,8 +582,8 @@ class Object(MapPart):
             restart_if_false_func=instr.RestartIfObjectDestroyed,
         )
 
-    @property
-    def coord_entity_type(self):
+    @classmethod
+    def get_coord_entity_type(cls):
         from soulstruct.base.events.emevd.enums import CoordEntityType
 
         return CoordEntityType.Object
@@ -574,6 +602,7 @@ class Object(MapPart):
 
 class Character(MapPart):
     """Condition upon a character as a shortcut to condition upon them being alive."""
+
     def __call__(self, negate=False, condition=None, skip_lines=0):
         from soulstruct.base.events.emevd.utils import get_value_test
         from soulstruct.base.events.emevd import instructions as instr
@@ -591,8 +620,8 @@ class Character(MapPart):
             if_false_func=instr.IfCharacterDead,
         )
 
-    @property
-    def coord_entity_type(self):
+    @classmethod
+    def get_coord_entity_type(cls):
         from soulstruct.base.events.emevd.enums import CoordEntityType
 
         return CoordEntityType.Character
@@ -614,6 +643,12 @@ class PlayerStart(MapPart):
     @classmethod
     def get_msb_entry_type_subtype(cls, pluralized_subtype=False):
         return ("Parts", "PlayerStarts") if pluralized_subtype else ("Parts", "PlayerStart")
+
+    @classmethod
+    def get_id_start_and_max(cls, game: Game) -> tuple[int, int]:
+        if game in (DARK_SOULS_PTDE, DARK_SOULS_DSR):
+            return 990, 999
+        raise NotImplementedError(f"Entity ID range not implemented for {game.name}.")
 
 
 class Collision(MapPart):
@@ -668,4 +703,4 @@ AnimatedTyping = tp.Union[Character, Object, int]
 MapPieceTyping = tp.Union[MapPiece, int]
 CollisionTyping = tp.Union[Collision, int]
 NavigationEventTyping = tp.Union[NavigationEvent, int]
-# TODO
+# TODO: More.

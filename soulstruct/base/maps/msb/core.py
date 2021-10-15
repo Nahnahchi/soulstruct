@@ -163,8 +163,11 @@ class MSB(GameFile, GameSpecificType, abc.ABC):
 
         return self.HEADER + packed_models + packed_events + packed_regions + packed_parts
 
-    def get_entry_by_name(self, name: str, entry_types=()):
-        """Get `MSBEntry` with name `name` that is one of the given `entry_types`, or any type if `entry_types=()`."""
+    def get_entry_by_name(self, name: str, entry_types=()) -> tp.Optional[MSBEntry]:
+        """Get `MSBEntry` with name `name` that is one of the given `entry_types`, or any type if `entry_types=()`.
+
+        Raises a `KeyError` if the name cannot be found, and a `ValueError` if multiple entries are found.
+        """
         if not entry_types:
             entry_types = ("parts", "regions", "events", "models")
         results = {}
@@ -175,10 +178,40 @@ class MSB(GameFile, GameSpecificType, abc.ABC):
             except KeyError:
                 pass
         if not results:
-            raise ValueError(f"Could not find an entry named '{name}' with type {entry_types} in MSB.")
+            raise KeyError(f"Could not find an entry named '{name}' with type {entry_types} in MSB.")
         if len(results) > 1:
             raise ValueError(f"Found entries of multiple types with name '{name}': {list(results)}")
         return next(iter(results.values()))
+
+    def to_dict(self, ignore_defaults=True) -> dict:
+        """Return a dictionary form of the MSB.
+
+        If `ignore_defaults=True` (default), entry fields that have the default values for that entry subclass will not
+        be included in the entry's dictionary.
+
+        TODO: Later MSB versions may have header data.
+        """
+        return {
+            "parts": self.parts.to_dict(ignore_defaults=ignore_defaults),
+            "events": self.events.to_dict(ignore_defaults=ignore_defaults),
+            "regions": self.regions.to_dict(ignore_defaults=ignore_defaults),
+            "models": self.models.to_dict(ignore_defaults=ignore_defaults),
+        }
+
+    def load_dict(self, data: dict, clear_old_data=True):
+        if clear_old_data:
+            self.parts.clear()
+            self.events.clear()
+            self.regions.clear()
+            self.models.clear()
+        for entry_type in ("parts", "events", "regions", "models"):
+            entry_list = getattr(self, entry_type)  # type: MSBEntryList
+            for entry_subtype_name, entries in data.get(entry_type, []).items():
+                entry_subtype_enum = getattr(entry_list.ENTRY_SUBTYPE_ENUM, entry_subtype_name)
+                subtype_class = entry_list.SUBTYPE_CLASSES[entry_subtype_enum]
+                for entry_dict in entries:
+                    entry = subtype_class(**entry_dict)
+                    entry_list.add_entry(entry)
 
     def rename_references(self, old_name: str, new_name: str, entry_types: tp.Sequence[str] = ()):
         """Looks for all linked references to `old_name` in parts and events, and renames any to `new_name`.
@@ -261,7 +294,7 @@ class MSB(GameFile, GameSpecificType, abc.ABC):
         results += [e for e in self.events.get_entries() if e.entity_id == entity_id]
         results += [e for e in self.regions.get_entries() if e.entity_id == entity_id]
         if not results:
-            return None
+            raise KeyError(f"Could not find an entry with entity ID {entity_id} in MSB.")
         elif len(results) > 1:
             if allow_multiple:
                 _LOGGER.warning(
@@ -271,6 +304,44 @@ class MSB(GameFile, GameSpecificType, abc.ABC):
             else:
                 raise ValueError(f"Found multiple entries with entity ID {entity_id} in MSB. This should not happen.")
         return results[0]
+
+    def clear_all(self):
+        """Clear all four entry lists."""
+        self.models.clear()
+        self.events.clear()
+        self.regions.clear()
+        self.parts.clear()
+
+    def merge(self, other_msb_source: tp.Union[GameFile.Typing, MSB], filter_func: tp.Callable = None):
+        """Merge `other_msb_source` into this one by simply appending each of the other MSB's four entry lists to this.
+
+        If `filter_func` is given, only entries (of all four types) for which `filter_func(entry) == True` will be
+        merged in. Make sure the function can handle all four entry types, if appropriate.
+
+        If any (non-filtered-out) entry in `other_msb_source` has the same name as an existing entry in this MSB, a
+        `ValueError` will be raised.
+
+        Returns a copy of the MSB.
+        """
+        if filter_func is not None and not callable(filter_func):
+            raise ValueError("`filter_func` must be callable, take an MSB entry as an argument, and return a bool.")
+        if not isinstance(other_msb_source, self.__class__):
+            other_msb_source = self.__class__(other_msb_source)
+        merged_msb = self.copy()
+        for entry_type in ("Model", "Event", "Region", "Part"):  # capitalized for nice error message below
+            existing_entries = merged_msb[entry_type]
+            existing_entry_list = set(existing_entries.get_entry_names())
+            other_entry_list = other_msb_source[entry_type]
+            for other_entry in other_entry_list:
+                if filter_func is not None and not filter_func(other_entry):
+                    continue  # skip entry
+                if other_entry.name in existing_entry_list:
+                    raise ValueError(
+                        f"Cannot merge {entry_type} '{other_entry.name}' into this MSB. Name already exists."
+                    )
+                existing_entries.add_entry(other_entry)
+                existing_entry_list.add(other_entry.name)
+        return merged_msb
 
     def move_map(
         self,
@@ -465,3 +536,105 @@ class MSB(GameFile, GameSpecificType, abc.ABC):
 
     def __iter__(self):
         return iter((self.models, self.events, self.regions, self.parts))
+
+    def new_sound_event_with_box(
+        self,
+        translate: tp.Union[Vector3, tuple, list],
+        rotate: tp.Union[Vector3, tuple, list],
+        width: float,
+        depth: float,
+        height: float,
+        **sound_event_kwargs,
+    ):
+        if "base_region_name" in sound_event_kwargs:
+            raise KeyError("`base_region_name` will be created and assigned automatically.")
+        sound = self.events.new_sound(**sound_event_kwargs)
+        box = self.regions.new_box(
+            name=f"_SoundEvent_{sound.name.lstrip('_')}",
+            translate=translate,
+            rotate=rotate,
+            width=width,
+            depth=depth,
+            height=height,
+        )
+        sound.base_region_name = box.name
+        return sound
+
+    def new_sound_event_with_sphere(
+        self,
+        translate: tp.Union[Vector3, tuple, list],
+        rotate: tp.Union[Vector3, tuple, list],
+        radius: float,
+        **sound_event_kwargs,
+    ):
+        if "base_region_name" in sound_event_kwargs:
+            raise KeyError("`base_region_name` will be created and assigned automatically.")
+        sound = self.events.new_sound(**sound_event_kwargs)
+        sphere = self.regions.new_sphere(
+            name=f"_SoundEvent_{sound.name.lstrip('_')}",
+            translate=translate,
+            rotate=rotate,
+            radius=radius,
+        )
+        sound.base_region_name = sphere.name
+        return sound
+
+    def new_vfx_event_with_point(
+        self,
+        translate: tp.Union[Vector3, tuple, list],
+        rotate: tp.Union[Vector3, tuple, list],
+        point_entity_enum: tp.Optional[RegionPoint] = None,
+        **vfx_event_kwargs,
+    ):
+        if "base_region_name" in vfx_event_kwargs:
+            raise KeyError("`base_region_name` will be created and assigned automatically.")
+        vfx = self.events.new_vfx(**vfx_event_kwargs)
+        point_name = f"_VFXEvent_{vfx.name.lstrip('_')}"
+        if point_entity_enum is not None:
+            if point_entity_enum.name != point_name:
+                raise ValueError(f"Name of `point_entity_enum` must be '{point_name}', not '{point_entity_enum.name}'.")
+            point_entity_id = point_entity_enum.value
+        else:
+            point_entity_id = -1
+        point = self.regions.new_point(
+            name=point_name,
+            entity_id=point_entity_id,
+            translate=translate,
+            rotate=rotate,
+        )
+        vfx.base_region_name = point.name
+        return vfx
+
+    def new_spawn_point_event_with_point(
+        self,
+        translate: tp.Union[Vector3, tuple, list],
+        rotate: tp.Union[Vector3, tuple, list],
+        **spawn_point_event_kwargs,
+    ):
+        if "base_region_name" in spawn_point_event_kwargs:
+            raise KeyError("`base_region_name` will be created and assigned automatically.")
+        spawn_point = self.events.new_spawn_point(**spawn_point_event_kwargs)
+        point = self.regions.new_point(
+            name=f"_SpawnPointEvent_{spawn_point.name.lstrip('_')}",
+            translate=translate,
+            rotate=rotate,
+        )
+        spawn_point.spawn_point_region_name = point.name
+        return spawn_point
+
+    def new_message_event_with_point(
+        self,
+        translate: tp.Union[Vector3, tuple, list],
+        rotate: tp.Union[Vector3, tuple, list],
+        **message_event_kwargs,
+    ):
+        if "base_region_name" in message_event_kwargs:
+            raise KeyError("`base_region_name` will be created and assigned automatically.")
+        message = self.events.new_message(**message_event_kwargs)
+        point = self.regions.new_point(
+            name=f"_MessageEvent_{message.name.lstrip('_')}",
+            translate=translate,
+            rotate=rotate,
+        )
+        message.base_region_name = point.name
+        return message

@@ -94,26 +94,34 @@ class BaseBinder(GameFile, abc.ABC):
             raise ValueError(f"Could not find unpacked binder directory {repr(directory)}.")
         with (directory / "binder_manifest.json").open("r", encoding="shift-jis") as f:
             manifest = json.load(f)
-        self.load_manifest_header(manifest)  # abstract
+        for field, value in self.get_manifest_header(manifest).items():
+            setattr(self, field, value)
         self.add_entries_from_manifest(manifest["entries"], directory, manifest["use_id_prefix"])
 
-    def load_manifest_header(self, manifest: dict):
+    def get_manifest_header(self, manifest: tp.Dict) -> tp.Dict[str, tp.Any]:
+        """Extract manifest header data from given `manifest` dictionary and parse them into appropriate types.
+
+        Other keys may be present in `manifest`, and will be ignored.
+        """
         if "version" not in manifest:
             raise BinderError("JSON manifest file does not contain 'version' key.")
-        if manifest["version"] != self.__class__.__name__:
+        if manifest["version"] not in [base.__name__ for base in self.__class__.__bases__]:
             raise BinderError(
                 f"Version of file ({manifest['version']}) does not match "
                 f"`BaseBinder` child class name ({self.__class__.__name__})."
             )
-        self.dcx_magic = tuple(manifest["dcx_magic"])
-        self.signature = manifest["signature"]
-        self.flags = BinderFlags(manifest["flags"])
-        self.big_endian = manifest["big_endian"]
-        self.bit_big_endian = manifest["bit_big_endian"]
+        loaded_manifest = {
+            "dcx_magic": tuple(manifest["dcx_magic"]),
+            "signature": manifest["signature"],
+            "flags": BinderFlags(manifest["flags"]),
+            "big_endian": manifest["big_endian"],
+            "bit_big_endian": manifest["bit_big_endian"],
+        }
         for field in self.EXTRA_MANIFEST_FIELDS:
-            setattr(self, field, manifest[field])
+            loaded_manifest[field] = manifest[field]
+        return loaded_manifest
 
-    def add_entries_from_manifest(self, entries: dict, directory: tp.Union[str, Path], use_id_prefix: bool):
+    def add_entries_from_manifest(self, entries: tp.Dict, directory: tp.Union[str, Path], use_id_prefix: bool):
         directory = Path(directory)
         unsorted_entries = {}  # maps ID to `(path, data, flags)` tuple
         for root, entry_dicts in entries.items():

@@ -12,7 +12,6 @@ from .enums import RestartType
 from .instruction import Instruction
 
 if tp.TYPE_CHECKING:
-    from soulstruct.game_types.msb_types import MapEntity
     from soulstruct.utilities.binary import BinaryStruct, BinaryReader
     from .utils import EntityEnumsManager
 
@@ -73,6 +72,8 @@ class EventArg(abc.ABC):
 
 class Event(abc.ABC):
 
+    instructions: list[Instruction]
+
     HEADER_STRUCT: BinaryStruct = None
     Instruction: tp.Type[Instruction] = None
     EventArg: tp.Type[EventArg] = None
@@ -84,7 +85,7 @@ class Event(abc.ABC):
     def __init__(self, event_id=0, restart_type=0, instructions=None):
         self.event_id = event_id
         self.restart_type = restart_type
-        self.instructions = instructions if instructions else []  # type: list[Instruction]
+        self.instructions = instructions if instructions else []
 
     @classmethod
     def unpack_event_dict(
@@ -112,7 +113,12 @@ class Event(abc.ABC):
                 # Attach event arg replacements to their instruction line.
                 instruction_list[arg_r.line].event_args.append(arg_r)
 
-            event_dict[d["event_id"]] = cls(d["event_id"], d["restart_type"], instruction_list)
+            if event_id := d["event_id"] in event_dict:
+                _LOGGER.warning(
+                    f"Event ID {event_id} appears multiple times in EMEVD file. Only the first one will be kept."
+                )
+            else:
+                event_dict[d["event_id"]] = cls(d["event_id"], d["restart_type"], instruction_list)
 
         return event_dict
 

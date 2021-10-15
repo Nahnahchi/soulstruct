@@ -26,6 +26,9 @@ _LOGGER = logging.getLogger(__name__)
 class EMEVD(GameFile, abc.ABC):
 
     events: dict[int, Event]
+    packed_strings: bytes
+    linked_file_offset: list[int]
+    map_name: str
 
     Event: tp.Type[Event] = None
     EVS_PARSER: tp.Type[EVSParser] = None
@@ -150,16 +153,28 @@ class EMEVD(GameFile, abc.ABC):
         for event in self.events.values():
             event.update_run_event_instructions()
 
-    def load_dict(self, data: dict):
-        self.map_name = None
+    def load_dict(self, data: dict, clear_old_data=True):
+        if clear_old_data:
+            self.events = {}
+            self.packed_strings = b""
+            self.linked_file_offsets = []
+            self.map_name = ""
+        else:
+            if self.map_name and (new_map_name := data.pop("map_name", "")) not in {"", self.map_name}:
+                raise ValueError(f"New map name '{new_map_name}' conflicts with old map name '{self.map_name}'.")
         try:
-            self.linked_file_offsets = data.pop("linked")
+            linked_file_offsets = data.pop("linked")
         except KeyError:
             _LOGGER.warning("No linked file offsets found in EMEVD source.")
+        else:
+            # Increment new offsets by existing packed string length.
+            self.linked_file_offsets += [offset + len(self.packed_strings) for offset in linked_file_offsets]
         try:
-            self.packed_strings = data.pop("strings")
+            packed_strings = data.pop("strings")
         except KeyError:
             _LOGGER.warning("No strings found in EMEVD source.")
+        else:
+            self.packed_strings += packed_strings
         self.events.update(data)
 
     def build_from_numeric_path(self, numeric_path):
@@ -268,6 +283,7 @@ class EMEVD(GameFile, abc.ABC):
             event.update_evs_function_args()
 
         return {
+            "map_name": self.map_name,
             "linked": self.linked_file_offsets,
             "strings": self.packed_strings,
             **self.events,
@@ -485,3 +501,43 @@ class EMEVD(GameFile, abc.ABC):
             f.write(self.to_evs(
                 entity_star_module_paths, entity_non_star_module_paths, warn_missing_enums, entity_module_prefix
             ))
+
+    def merge(
+        self,
+        other_emevd_source: tp.Union[EMEVD, GameFile.Typing],
+        merge_events=(0, 50),
+        event_id_offset=0,
+    ) -> EMEVD:
+        """Return a new `EMEVD` creating by emerging all events of this instance with those of `other_emevd_source`.
+
+        Event IDs in `merge_events` will have their instruction sets merged (with this instance's instrutions appearing
+        first). By default, events 0 (constructor) and 50 (preconstructor) are merged this way. Any other event IDs that
+        appear in both sources will raise a `ValueError`.
+
+        Events from `other_emevd_source` will have `event_id_offset` added to their ID before being merged (default 0,
+        so no change). This is useful for, say, defining some common events that will share an ID suffix across all
+        maps. You will probably want to set `merge_events=()` for this use case.
+
+        NOTE: Currently cannot merge any events that use event arguments.
+        """
+        if not isinstance(other_emevd_source, self.__class__):
+            other_emevd_source = self.__class__(other_emevd_source)
+        combined_emevd = self.copy()
+        for event_id, other_event in other_emevd_source.events.items():
+            event_id += event_id_offset
+            if event_id not in combined_emevd.events:
+                combined_emevd.events[event_id] = other_event
+            elif event_id in merge_events:
+                existing_event = combined_emevd.events[event_id]
+                if existing_event.event_arg_count > 0 or other_event.event_arg_count > 0:
+                    raise ValueError(
+                        f"Cannot merge event {event_id}, as it uses event arguments in at least one source."
+                    )
+                existing_event.instructions += other_event.instructions
+            else:
+                raise ValueError(f"Event {event_id} appears in both EMEVD sources and is not in `merge_events`.")
+        return combined_emevd
+
+    def __add__(self, other_emevd_source: tp.Union[EMEVD, GameFile.Typing]) -> EMEVD:
+        """Operator shortcut for merging EMEVD sources, merging the standard pre/constructor events `(0, 50)`."""
+        return self.merge(other_emevd_source)
